@@ -63,7 +63,13 @@ async function runManualPipeline() {
     renderResult(latestResult);
     setStatus(latestResult.improveMessage || "Done");
   } catch (err) {
-    setError(err?.message || String(err));
+    // A first-run model download is expected, not an error. Clicking Run again supplies the
+    // user gesture Chrome requires to start it.
+    if (err?.name === "QuickTranslateSetupError") {
+      setStatus(err.message);
+    } else {
+      setError(err?.message || String(err));
+    }
   } finally {
     setBusy(false);
   }
@@ -127,7 +133,7 @@ function refinedDisplayText(result) {
   }
 
   if (result?.improveAvailable === false) {
-    return "Refinement unavailable in this Chrome setup.";
+    return result.improveMessage || "Refinement unavailable in this Chrome setup.";
   }
 
   return "Refining...";

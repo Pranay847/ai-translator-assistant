@@ -30,8 +30,19 @@
     expectedOutputs: [{ type: "text", languages: ["en"] }]
   };
   const FAST_REFINE_TIMEOUT_MS = 7000;
-  const PROMPT_REFINE_TIMEOUT_MS = 30000;
+  // Refinement measured ~27s on a warm machine, so 30s flaked. This bounds generation only:
+  // model download is covered separately by the create watchdog below.
+  const PROMPT_REFINE_TIMEOUT_MS = 120000;
+  const PROMPT_TIMEOUT_MS = 30000;
   const MAX_PROMPT_REFINE_CHARS = 4000;
+  const AVAILABILITY_TIMEOUT_MS = 10000;
+  const DETECT_TIMEOUT_MS = 15000;
+  const TRANSLATE_TIMEOUT_MS = 60000;
+  // A real download proves it is alive: Chrome emits downloadprogress roughly every 50ms.
+  // Wait generously for the first event, then treat 60s of silence as a wedged create.
+  const CREATE_FIRST_PROGRESS_TIMEOUT_MS = 180000;
+  const CREATE_STALL_TIMEOUT_MS = 60000;
+  const SETUP_GESTURE_TIMEOUT_MS = 120000;
 
   const TRANSLATOR_LANGUAGES = new Set([
     "ar",
@@ -94,7 +105,178 @@
   const promptSessionPromises = new Map();
   const pipelineCache = new Map();
 
+  // A shared model download is created once, so its progress cannot belong to one run's
+  // callback. These point at whatever run is currently on screen.
+  let statusSink = () => {};
+  let gestureRequester = null;
+  let activeCancel = null;
+
+  class QuickTranslateSetupError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "QuickTranslateSetupError";
+    }
+  }
+
+  function timeoutError(message) {
+    const error = new Error(message);
+    error.name = "QuickTranslateTimeout";
+    return error;
+  }
+
+  // Races rather than only aborting: abort is best effort, and an implementation that ignores
+  // the signal would otherwise leave a promise that never settles.
+  function withDeadline(promise, ms, message) {
+    let timer = null;
+    const guard = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(timeoutError(message)), ms);
+    });
+    return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+  }
+
+  function forgetIfCurrent(map, key, pending) {
+    if (map.get(key) === pending) {
+      map.delete(key);
+    }
+  }
+
+  function needsUserGesture(error) {
+    // The message test is load-bearing: a cross-origin frame blocked by Permissions Policy
+    // also throws NotAllowedError, and routing that to a setup card would loop forever.
+    return error?.name === "NotAllowedError" && /user gesture/i.test(error?.message || "");
+  }
+
+  function isPermissionsPolicyBlock(error) {
+    return error?.name === "NotAllowedError" && /permission[s]? policy/i.test(error?.message || "");
+  }
+
+  function startElapsedTicker(label) {
+    const startedAt = Date.now();
+    statusSink(`${label}...`);
+    const timer = setInterval(() => {
+      statusSink(`${label}... ${Math.round((Date.now() - startedAt) / 1000)}s`);
+    }, 1000);
+    return () => clearInterval(timer);
+  }
+
+  async function requestDownloadGesture(label) {
+    if (!gestureRequester) {
+      throw new QuickTranslateSetupError(
+        `One-time setup needed: Chrome must download the ${label}. Click Run again to start the download — it happens once and then works offline.`
+      );
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new QuickTranslateSetupError(`Setup for the ${label} was not started.`));
+      }, SETUP_GESTURE_TIMEOUT_MS);
+
+      gestureRequester({
+        label,
+        proceed() {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+  }
+
+  // Bounds create() without aborting it: aborting could cancel a multi-GB browser-level
+  // download. A late model from an abandoned attempt is destroyed rather than leaked.
+  function createModelOnce(factory, options, label) {
+    let settled = false;
+    let abandoned = false;
+    let timer = null;
+    let rejectGuard = () => {};
+
+    const guard = new Promise((_, reject) => {
+      rejectGuard = reject;
+    });
+
+    const beat = (ms) => {
+      if (settled) {
+        return;
+      }
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        abandoned = true;
+        rejectGuard(timeoutError(`Preparing the ${label} took too long. Check your connection and try again.`));
+      }, ms);
+    };
+
+    const pending = factory.create({
+      ...options,
+      monitor: createDownloadMonitor(label, () => beat(CREATE_STALL_TIMEOUT_MS))
+    });
+
+    beat(CREATE_FIRST_PROGRESS_TIMEOUT_MS);
+
+    pending.then(
+      (model) => {
+        if (abandoned) {
+          model?.destroy?.();
+        }
+      },
+      () => {}
+    );
+
+    const tracked = pending.then(
+      (value) => {
+        settled = true;
+        clearTimeout(timer);
+        return value;
+      },
+      (error) => {
+        settled = true;
+        clearTimeout(timer);
+        throw error;
+      }
+    );
+
+    return Promise.race([tracked, guard]);
+  }
+
+  async function createModel(factory, options, label) {
+    try {
+      return await createModelOnce(factory, options, label);
+    } catch (error) {
+      if (isPermissionsPolicyBlock(error) && !needsUserGesture(error)) {
+        throw new Error("This page blocks Chrome's built-in AI. Open the extension popup from the toolbar and paste the text there.");
+      }
+
+      if (!needsUserGesture(error)) {
+        throw error;
+      }
+
+      // The failing create() started no download and had no side effects, so retrying after a
+      // real in-page click is safe. The click grants full transient activation.
+      await requestDownloadGesture(label);
+      return createModelOnce(factory, options, label);
+    }
+  }
+
   async function runPipeline(text, tone = "professional", onStatus = () => {}, options = {}) {
+    const sink = typeof onStatus === "function" ? onStatus : () => {};
+    const requester = typeof options.onNeedsGesture === "function" ? options.onNeedsGesture : null;
+    statusSink = sink;
+    gestureRequester = requester;
+
+    try {
+      return await runPipelineInner(text, tone, sink, options);
+    } finally {
+      if (statusSink === sink) {
+        statusSink = () => {};
+      }
+      if (gestureRequester === requester) {
+        gestureRequester = null;
+      }
+    }
+  }
+
+  async function runPipelineInner(text, tone = "professional", onStatus = () => {}, options = {}) {
     const original = text.trim();
     const mode = options.mode === "improve" ? "improve" : "translate";
     const onPartial = typeof options.onPartial === "function" ? options.onPartial : () => {};
@@ -188,7 +370,11 @@
       if (availability !== "unavailable") {
         try {
           const detector = await getLanguageDetector();
-          const results = await detector.detect(text);
+          const results = await withDeadline(
+            detector.detect(text),
+            DETECT_TIMEOUT_MS,
+            "Detecting the language took too long."
+          );
 
           const best = results?.[0];
           if (best?.detectedLanguage && best.confidence >= MIN_LANGUAGE_CONFIDENCE) {
@@ -216,10 +402,17 @@
       if (availability !== "unavailable") {
         try {
           const translator = await getTranslator(options);
-          const translated = await translator.translate(text);
+          const translated = await withDeadline(
+            translator.translate(text),
+            TRANSLATE_TIMEOUT_MS,
+            "Translating took too long."
+          );
           return normalizeModelText(translated);
         } catch (error) {
-          translatorPromises.delete(translatorKey(options));
+          if (error?.name === "QuickTranslateSetupError") {
+            throw error;
+          }
+          forgetIfCurrent(translatorPromises, translatorKey(options), translatorPromises.get(translatorKey(options)));
           // Fall through to legacy or Prompt API paths.
         }
       }
@@ -294,13 +487,20 @@
           const rewriter = await getRewriter(tone, options);
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), timeoutMs);
-          const result = await rewriter.rewrite(text, {
-            context: `${toneInstruction(tone)} Correct grammar, keep the meaning intact, and avoid returning the original wording unchanged.`,
-            signal: controller.signal
-          }).finally(() => clearTimeout(timeout));
+          const result = await withDeadline(
+            rewriter.rewrite(text, {
+              context: `${toneInstruction(tone)} Correct grammar, keep the meaning intact, and avoid returning the original wording unchanged.`,
+              signal: controller.signal
+            }),
+            timeoutMs,
+            "Refining took too long. The translation above is ready."
+          ).finally(() => clearTimeout(timeout));
           return normalizeModelText(result);
-        } catch {
-          rewriterPromises.delete(tone);
+        } catch (error) {
+          if (error?.name === "QuickTranslateSetupError") {
+            throw error;
+          }
+          forgetIfCurrent(rewriterPromises, tone, rewriterPromises.get(tone));
           // Fall through to legacy or Prompt API paths.
         }
       }
@@ -336,24 +536,57 @@
         `Literal translation to improve:\n${translated}`
       ].join("\n"),
       onStatus,
-      { timeoutMs: PROMPT_REFINE_TIMEOUT_MS }
+      {
+        timeoutMs: PROMPT_REFINE_TIMEOUT_MS,
+        progressLabel: `Refining translation: ${toneLabel(tone)}`
+      }
     );
   }
 
+  function improvementUnavailable(message) {
+    return {
+      available: false,
+      corrected: "",
+      refined: "",
+      message
+    };
+  }
+
+  // "Refinement unavailable in this Chrome setup." must only appear when that is actually true.
+  function refineFailureMessage(error) {
+    if (error?.name === "QuickTranslateSetupError") {
+      return error.message;
+    }
+    if (error?.name === "QuickTranslateTimeout") {
+      return "Refining took too long. The translation above is ready.";
+    }
+    if (error?.name === "AbortError") {
+      return "Stopped. The translation above is ready.";
+    }
+    return null;
+  }
+
   async function tryImproveText(original, translated, detectedLanguage, tone, onStatus) {
-    if (original.length + translated.length <= MAX_PROMPT_REFINE_CHARS) {
-      try {
-        const refined = await improveWithPrompt(original, translated, detectedLanguage, tone, onStatus);
-        if (isMeaningfullyDifferent(refined, translated)) {
-          return {
-            available: true,
-            corrected: translated,
-            refined,
-            message: "Done"
-          };
-        }
-      } catch {
-        // Prompt refinement is optional; keep the translated result if it is unavailable or slow.
+    if (original.length + translated.length > MAX_PROMPT_REFINE_CHARS) {
+      return improvementUnavailable("Text is too long to refine. The translation above is ready.");
+    }
+
+    let reported = null;
+
+    try {
+      const refined = await improveWithPrompt(original, translated, detectedLanguage, tone, onStatus);
+      if (isMeaningfullyDifferent(refined, translated)) {
+        return {
+          available: true,
+          corrected: translated,
+          refined,
+          message: "Done"
+        };
+      }
+    } catch (error) {
+      reported = refineFailureMessage(error);
+      if (reported) {
+        return improvementUnavailable(reported);
       }
     }
 
@@ -367,16 +600,11 @@
           message: "Done"
         };
       }
-    } catch {
-      // Refinement is optional; fall back without reporting an extension error.
+    } catch (error) {
+      reported = refineFailureMessage(error) || reported;
     }
 
-    return {
-      available: false,
-      corrected: "",
-      refined: "",
-      message: "Refinement unavailable in this Chrome setup."
-    };
+    return improvementUnavailable(reported || "Refinement unavailable in this Chrome setup.");
   }
 
   async function detectLanguageWithPrompt(text, onStatus) {
@@ -414,56 +642,65 @@
       throw new Error("Chrome Prompt API is unavailable on this device.");
     }
 
+    // getPromptSession() can take minutes on a cold profile; it is bounded by the create
+    // watchdog, not by the generation deadline below.
     const session = await getPromptSession(systemPrompt);
     const controller = new AbortController();
-    const timeout = options.timeoutMs
-      ? setTimeout(() => controller.abort(), options.timeoutMs)
-      : null;
+    const cancel = () => controller.abort();
+    const stopTicker = options.progressLabel ? startElapsedTicker(options.progressLabel) : () => {};
+    activeCancel = cancel;
 
     try {
-      const result = await session.prompt(userPrompt, {
-        signal: controller.signal
-      });
+      const result = await withDeadline(
+        session.prompt(userPrompt, { signal: controller.signal }),
+        options.timeoutMs || PROMPT_TIMEOUT_MS,
+        "Refining took too long. The translation above is ready."
+      );
       return normalizeModelText(result);
     } catch (error) {
-      const cached = await promptSessionPromises.get(systemPrompt).catch(() => null);
-      cached?.destroy?.();
-      promptSessionPromises.delete(systemPrompt);
+      // Never await the cached entry here: if it is the hung promise, the error path would
+      // hang too. Drop it without blocking, and only if it is still the current one.
+      const entry = promptSessionPromises.get(systemPrompt);
+      if (entry) {
+        entry.then((cached) => cached?.destroy?.(), () => {});
+        forgetIfCurrent(promptSessionPromises, systemPrompt, entry);
+      }
       throw error;
     } finally {
-      if (timeout) {
-        clearTimeout(timeout);
+      stopTicker();
+      if (activeCancel === cancel) {
+        activeCancel = null;
       }
     }
   }
 
-  async function getLanguageDetector() {
+  function getLanguageDetector() {
     if (!detectorPromise) {
-      detectorPromise = LanguageDetector.create({
-        monitor: createDownloadMonitor()
-      }).catch((error) => {
-        detectorPromise = null;
+      const pending = createModel(LanguageDetector, {}, "language detector").catch((error) => {
+        if (detectorPromise === pending) {
+          detectorPromise = null;
+        }
         throw error;
       });
+      detectorPromise = pending;
     }
 
     return detectorPromise;
   }
 
-  async function getTranslator(options) {
+  function translationPackLabel(options) {
+    return `${languageLabel(options.sourceLanguage)} to English translation pack`;
+  }
+
+  function getTranslator(options) {
     const key = translatorKey(options);
 
     if (!translatorPromises.has(key)) {
-      translatorPromises.set(
-        key,
-        Translator.create({
-          ...options,
-          monitor: createDownloadMonitor()
-        }).catch((error) => {
-          translatorPromises.delete(key);
-          throw error;
-        })
-      );
+      const pending = createModel(Translator, options, translationPackLabel(options)).catch((error) => {
+        forgetIfCurrent(translatorPromises, key, pending);
+        throw error;
+      });
+      translatorPromises.set(key, pending);
     }
 
     return translatorPromises.get(key);
@@ -473,50 +710,46 @@
     return `${options.sourceLanguage}:${options.targetLanguage}`;
   }
 
-  async function getProofreader(options) {
+  function getProofreader(options) {
     if (!proofreaderPromise) {
-      proofreaderPromise = Proofreader.create({
-        ...options,
-        monitor: createDownloadMonitor()
-      }).catch((error) => {
-        proofreaderPromise = null;
+      const pending = createModel(Proofreader, options, "proofreading model").catch((error) => {
+        if (proofreaderPromise === pending) {
+          proofreaderPromise = null;
+        }
         throw error;
       });
+      proofreaderPromise = pending;
     }
 
     return proofreaderPromise;
   }
 
-  async function getRewriter(tone, options) {
+  function getRewriter(tone, options) {
     if (!rewriterPromises.has(tone)) {
-      rewriterPromises.set(
-        tone,
-        Rewriter.create({
-          ...options,
-          monitor: createDownloadMonitor()
-        }).catch((error) => {
-          rewriterPromises.delete(tone);
-          throw error;
-        })
-      );
+      const pending = createModel(Rewriter, options, "rewriting model").catch((error) => {
+        forgetIfCurrent(rewriterPromises, tone, pending);
+        throw error;
+      });
+      rewriterPromises.set(tone, pending);
     }
 
     return rewriterPromises.get(tone);
   }
 
-  async function getPromptSession(systemPrompt) {
+  function getPromptSession(systemPrompt) {
     if (!promptSessionPromises.has(systemPrompt)) {
-      promptSessionPromises.set(
-        systemPrompt,
-        LanguageModel.create({
+      const pending = createModel(
+        LanguageModel,
+        {
           ...PROMPT_MODEL_OPTIONS,
-          initialPrompts: [{ role: "system", content: systemPrompt }],
-          monitor: createDownloadMonitor()
-        }).catch((error) => {
-          promptSessionPromises.delete(systemPrompt);
-          throw error;
-        })
-      );
+          initialPrompts: [{ role: "system", content: systemPrompt }]
+        },
+        "on-device language model (about 2 GB)"
+      ).catch((error) => {
+        forgetIfCurrent(promptSessionPromises, systemPrompt, pending);
+        throw error;
+      });
+      promptSessionPromises.set(systemPrompt, pending);
     }
 
     return promptSessionPromises.get(systemPrompt);
@@ -540,7 +773,7 @@
     }
 
     if (result?.improveAvailable === false) {
-      return "Refinement unavailable in this Chrome setup.";
+      return result.improveMessage || "Refinement unavailable in this Chrome setup.";
     }
 
     return "Refining...";
@@ -564,22 +797,48 @@
       return "available";
     }
 
+    // A timeout must not read as "unavailable": that would skip the guarded create() that
+    // knows how to ask for a gesture. Throwing still means unavailable, as before.
+    const ask = async (opts) => {
+      let timer = null;
+      const timedOut = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("downloadable"), AVAILABILITY_TIMEOUT_MS);
+      });
+      try {
+        return await Promise.race([
+          opts ? factory.availability(opts) : factory.availability(),
+          timedOut
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
     try {
-      return options
-        ? await factory.availability(options)
-        : await factory.availability();
+      return await ask(options);
     } catch {
       try {
-        return await factory.availability();
+        return await ask(null);
       } catch {
         return "unavailable";
       }
     }
   }
 
-  function createDownloadMonitor() {
+  // event.loaded is a 0..1 fraction and event.total is always 1, so this reports a percentage
+  // rather than the "0.5/1" that loaded/total would produce. No events fire when the model is
+  // already available, so absence of progress is never treated as an error.
+  function createDownloadMonitor(label, onProgress = () => {}) {
     return (monitorTarget) => {
-      monitorTarget.addEventListener("downloadprogress", () => {});
+      monitorTarget.addEventListener("downloadprogress", (event) => {
+        onProgress();
+        const fraction = Number(event?.loaded);
+        if (!Number.isFinite(fraction)) {
+          return;
+        }
+        const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
+        statusSink(`Downloading ${label}: ${percent}%`);
+      });
     };
   }
 
@@ -791,6 +1050,13 @@
         }
       }, {
         mode,
+        onNeedsGesture({ label, proceed }) {
+          if (runId !== activeRunId) {
+            return;
+          }
+
+          panel.renderSetup({ label, proceed, original: text, mode, tone });
+        },
         onPartial(partial) {
           if (runId !== activeRunId || !partial.translated) {
             return;
@@ -818,6 +1084,36 @@
         panel.renderError(error);
       }
     }
+  }
+
+  // Makes the raised refine budget acceptable: the user always has an escape hatch.
+  function cancelActiveRun() {
+    activeRunId += 1;
+    if (activeCancel) {
+      activeCancel();
+      activeCancel = null;
+    }
+
+    if (!panelController) {
+      return;
+    }
+
+    if (lastResult?.translated) {
+      const stopped = {
+        ...lastResult,
+        refined: "",
+        improveAvailable: false,
+        improveMessage: "Stopped. The translation above is ready."
+      };
+      lastResult = stopped;
+      panelController.renderResult(stopped, {
+        canReplace: Boolean(lastEditableTarget),
+        busy: false
+      });
+      return;
+    }
+
+    panelController.updateStatus("Stopped.");
   }
 
   function getPanel() {
@@ -1077,6 +1373,30 @@
       }
     }
 
+    // The status node carries data-status, so download percentages land in this same card.
+    function renderSetup({ label, proceed, original, mode, tone }) {
+      body.replaceChildren();
+      body.append(createToolbar(mode, tone, false, true));
+      body.append(createStatus(
+        `One-time setup needed. Chrome must download the ${label} before this can run. It downloads once, stays on your device, and nothing you translate is ever sent to a server.`
+      ));
+
+      const row = document.createElement("div");
+      row.className = "toolbar";
+      const go = document.createElement("button");
+      go.className = "primary-button";
+      go.type = "button";
+      go.textContent = "Download & Continue";
+      go.addEventListener("click", () => {
+        row.remove();
+        updateStatus("Starting download...");
+        proceed();
+      });
+      row.append(go);
+      body.append(row);
+      body.append(createSection("Original", original));
+    }
+
     function renderError(error) {
       body.replaceChildren();
       body.append(createStatus(error?.message || String(error), "error"));
@@ -1156,6 +1476,18 @@
         toolbar.append(refineAgain);
       }
 
+      if (busy) {
+        const stop = document.createElement("button");
+        stop.className = "primary-button";
+        stop.type = "button";
+        stop.textContent = "Stop";
+        stop.title = "Stop and keep the translation";
+        stop.addEventListener("click", () => {
+          cancelActiveRun();
+        });
+        toolbar.append(stop);
+      }
+
       toolbar.append(copy, replace);
       return toolbar;
     }
@@ -1164,6 +1496,7 @@
       setLoading,
       updateStatus,
       renderResult,
+      renderSetup,
       renderError
     };
   }
