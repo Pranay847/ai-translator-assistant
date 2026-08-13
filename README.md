@@ -16,18 +16,46 @@ you can drag wherever you want. Or paste text straight into the toolbar popup.
   result can be written back in place
 - **Progressive output** — the translation renders as soon as it's ready, and
   refinement fills in afterward rather than blocking the UI
+- **Live progress** — model downloads report a percentage, and refinement shows a
+  running elapsed count so a long wait never looks like a freeze
+- **Stop** — abandon a slow refinement and keep the translation you already have
 - **Copy** the refined text, or the translation when refinement isn't available
 
 ## Requirements
 
 - Chrome 138 or newer (set in `manifest.json` as `minimum_chrome_version`)
-- Chrome's built-in AI enabled, with the on-device model downloaded
+- Chrome's built-in AI enabled
 
-The built-in AI APIs roll out at different paces. Translation and language
-detection are the baseline; the refinement step depends on the Rewriter,
-Proofreader, and Prompt APIs, which may not be present in every Chrome build.
-When refinement isn't available the extension says so and still gives you the
-translation — it doesn't fail or throw errors at you.
+The built-in AI APIs ship at different paces, so what you get depends on your
+Chrome build. Measured on Chrome 151:
+
+| API | Used for | Status on Chrome 151 |
+| --- | --- | --- |
+| `LanguageDetector` | detecting the source language | available |
+| `Translator` | translating to English | downloads one pack per language pair |
+| `LanguageModel` (Prompt) | refinement, and fallback translation | needs a one-time download of roughly 2 GB |
+| `Rewriter` | secondary refinement path | not present |
+| `Proofreader` | not currently wired in | not present |
+
+Refinement therefore runs on the Prompt API. If that model isn't available, the
+extension still translates and tells you refinement is unavailable — it doesn't
+fail or surface raw errors.
+
+## First run
+
+Chrome requires a user gesture before it will start downloading a model, so the
+first translation for a given language needs one click.
+
+**In the page panel:** a setup card appears explaining what needs downloading,
+with a **Download & Continue** button. Click it and the download starts, showing
+a percentage as it goes. The translation then completes on its own.
+
+**In the popup:** the status line asks you to click **Run** again. That second
+click is the gesture Chrome needs.
+
+This happens once per model. Downloads are per language pair, so the first
+Spanish translation and the first Japanese translation each need their own click.
+Refinement needs one too, because it uses a separate (and much larger) model.
 
 ## Install
 
@@ -62,6 +90,11 @@ click **Run**.
 Tone only applies to refinement, so the selector is disabled in Translate mode.
 Changing the tone re-runs refinement on the same text.
 
+Translation typically returns in well under a second once the language pack is
+downloaded. Refinement is much slower — around 20 to 30 seconds is normal — which
+is why the translation is shown as soon as it's ready and a **Stop** button is
+available while refinement runs.
+
 ## How it works
 
 The pipeline lives in `content.js` and runs entirely in the browser:
@@ -71,11 +104,23 @@ The pipeline lives in `content.js` and runs entirely in the browser:
 2. **Translate** — `Translator` for the detected language pair, falling back to
    the Prompt API for languages it doesn't cover
 3. **Refine** (opt-in) — the Prompt API with a tone-specific instruction, falling
-   back to `Rewriter`
+   back to `Rewriter` where that exists
 
 Each stage degrades rather than failing. If refinement produces nothing
 meaningfully different from the translation, it's reported as unavailable
 instead of showing you the same sentence twice.
+
+Model creation is funnelled through a single guarded path that:
+
+- catches the specific `NotAllowedError` Chrome raises when a download needs a
+  user gesture, and asks the UI for a real click instead of surfacing the error
+- distinguishes that from the same-named error thrown when a cross-origin frame
+  is blocked by Permissions Policy, which a click would never fix
+- bounds every wait, using download progress events as a liveness signal — a
+  genuinely slow multi-gigabyte download is never cancelled, but a wedged one
+  gives up and reports why
+- reports what actually went wrong (timed out, setup needed, text too long)
+  rather than always blaming the Chrome setup
 
 ## Privacy
 
@@ -97,6 +142,10 @@ popup.js         Popup logic, reuses the pipeline from content.js
 styles.css       Popup styles
 icons/           Toolbar icon (128px)
 ```
+
+There is no `content_scripts` entry in the manifest. `content.js` is injected on
+demand by `background.js` via `chrome.scripting.executeScript`, which keeps the
+permission footprint narrow; a guard in the file makes re-injection a no-op.
 
 ## Packaging
 
