@@ -1,0 +1,11 @@
+# Build artifacts — the packaged zip is generated, not source.
+# Regenerate with a spec-compliant zip tool before uploading to the Chrome Web Store.
+dist/
+*.zip
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/

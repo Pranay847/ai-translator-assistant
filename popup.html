@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-ai-translator-popup>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI Translator Assistant</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="popup-header">
+        <div>
+          <h1>AI Translator</h1>
+          <p id="status">Ready</p>
+        </div>
+      </header>
+
+      <section class="input-area">
+        <label for="input">Text</label>
+        <textarea id="input" rows="7" placeholder="Paste text here"></textarea>
+      </section>
+
+      <section class="controls">
+        <div class="field">
+          <label for="mode">Mode</label>
+          <select id="mode">
+            <option value="translate">Translate</option>
+            <option value="improve">Translate + Improve</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="tone">Tone</label>
+          <select id="tone">
+            <option value="professional">Professional</option>
+            <option value="casual">Casual</option>
+            <option value="friendly">Friendly</option>
+          </select>
+        </div>
+        <button id="run" type="button">Run</button>
+      </section>
+
+      <section id="output" class="output" hidden>
+        <div>
+          <h2>Detected Language</h2>
+          <p id="detected"></p>
+        </div>
+        <div>
+          <div class="output-heading">
+            <h2>Translated</h2>
+            <button id="copy" type="button">Copy</button>
+          </div>
+          <p id="translated"></p>
+        </div>
+        <div id="corrected-section" hidden>
+          <h2>Corrected</h2>
+          <p id="corrected"></p>
+        </div>
+        <div id="refined-section" hidden>
+          <h2>Refined</h2>
+          <p id="refined"></p>
+        </div>
+      </section>
+
+      <p id="error" class="error" hidden></p>
+    </main>
+
+    <script src="content.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

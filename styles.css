@@ -1,0 +1,170 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: #f8f7f2;
+  color: #242722;
+  margin: 0;
+  width: 360px;
+}
+
+button,
+select,
+textarea {
+  font: inherit;
+}
+
+.popup-shell {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.popup-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+h2,
+label {
+  color: #55584f;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+#status {
+  color: #436057;
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.input-area,
+.output {
+  display: grid;
+  gap: 7px;
+}
+
+textarea {
+  background: #fff;
+  border: 1px solid #cfcbbf;
+  border-radius: 8px;
+  color: #242722;
+  line-height: 1.45;
+  min-height: 132px;
+  padding: 10px;
+  resize: vertical;
+}
+
+textarea:focus,
+select:focus,
+button:focus {
+  outline: 2px solid #75a895;
+  outline-offset: 2px;
+}
+
+.controls {
+  align-items: end;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 72px;
+}
+
+.field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+select,
+button {
+  border-radius: 7px;
+  min-height: 36px;
+}
+
+select {
+  background: #fff;
+  border: 1px solid #c7c3b6;
+  color: #242722;
+  padding: 0 8px;
+}
+
+button {
+  background: #215f53;
+  border: 1px solid #174940;
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+  padding: 0 12px;
+}
+
+button:hover:not(:disabled) {
+  background: #174e45;
+}
+
+button:disabled {
+  background: #b7b3a8;
+  border-color: #aaa69b;
+  color: #5d5a52;
+  cursor: not-allowed;
+}
+
+.output {
+  border-top: 1px solid #ddd9cc;
+  padding-top: 12px;
+}
+
+.output > div {
+  display: grid;
+  gap: 4px;
+}
+
+.output p {
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.output-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+#copy {
+  background: #ecebe4;
+  border-color: #c7c3b6;
+  color: #242722;
+  min-height: 28px;
+  padding: 0 9px;
+}
+
+.error {
+  background: #fff0ee;
+  border: 1px solid #e2b8b0;
+  border-radius: 7px;
+  color: #7a281f;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 8px;
+}
