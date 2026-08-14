@@ -7,6 +7,14 @@
   box-sizing: border-box;
 }
 
+/* The .output rules below set display: grid, which outranks the browser's built-in
+   [hidden] { display: none }. Without this, popup.js toggling .hidden has no visual
+   effect: the empty Corrected section shows, and stale results stay on screen while
+   a new run is in progress. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   background: #f8f7f2;
   color: #242722;
